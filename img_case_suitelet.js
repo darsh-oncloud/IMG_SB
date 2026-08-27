@@ -2,35 +2,42 @@
  * @NApiVersion 2.1
  * @NScriptType Suitelet
  *
- * TAGeX — Simple Case Form Suitelet
+ * TAGeX — Simple Case Form Suitelet (v2)
  *
  * Flow:
  *   GET  -> render the form
- *   POST -> search Customer by email
- *             -> not found? search Contact by email (and use its parent company)
- *           -> attach whatever was found to the Case
- *           -> create the Case
+ *   POST -> search Customer by email, else Contact by email
+ *           -> attach Company (and Contact only when it belongs to that Company)
+ *           -> create the Case (with a retry that drops optional fields if NetSuite rejects them)
  *           -> email the internal team
- *           -> show thank-you with the case number
+ *           -> show the case number on success, or an honest error page on failure
  *
- * Deploy in SANDBOX first. Only the CONFIG block should need editing.
+ * Fixes vs v1:
+ *   - A Contact is only attached when the Case has a Company and the Contact belongs to it.
+ *     NetSuite validates the contact against the company at save(), not at setValue().
+ *   - save() is retried without optional fields instead of failing outright.
+ *   - The thank-you page no longer appears when the case was not created.
  */
 define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/email', 'N/log'],
   function (serverWidget, record, search, email, log) {
 
     // ── CONFIG ───────────────────────────────────────────────────
     var CFG = {
-      EMAIL_AUTHOR_ID: 297744,                 // employee record used as the "from"
-      NOTIFY_TO: ['leads@tagexbrands.com'],    // internal recipients
+      EMAIL_AUTHOR_ID: 3158,                        // must be an EMPLOYEE internal id
+      NOTIFY_TO: ['dsoni@oncloudconsulting.ca'],
 
-      CASE_CUSTOM_FORM: null,                  // e.g. 123 — null = default case form
-      CASE_STATUS: 1,                          // 1 = Not Started
-      CASE_ORIGIN: null,                       // e.g. internal id of "Web", or null
-      CASE_PRIORITY: 2,                        // 1 High, 2 Medium, 3 Low
+      CASE_CUSTOM_FORM: null,                       // e.g. 123 — null = default case form
+      CASE_STATUS: 1,                               // 1 = Not Started
+      CASE_ORIGIN: null,                            // internal id of "Web", or null
+      CASE_PRIORITY: 2,                             // 1 High, 2 Medium, 3 Low
 
-      CASE_LINK_BASE: 'https://5406208.app.netsuite.com/app/crm/support/supportcase.nl?id=',
+      // Used when the email matches nothing, or matches a contact with no parent company.
+      // Cases usually require a Company — point this at a generic "Website Enquiries" customer.
+      FALLBACK_CUSTOMER_ID: null,
 
-      TEST_MODE: false                         // true = print the lookup result, create nothing
+      CASE_LINK_BASE: 'https://4382108-sb1.app.netsuite.com/app/crm/support/supportcase.nl?id=',
+
+      TEST_MODE: false                              // true = print the lookup result, create nothing
     };
 
     // ── Helpers ──────────────────────────────────────────────────
@@ -59,7 +66,8 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/email', 'N/log'],
         source: 'customer',
         customerId: res[0].getValue('internalid'),
         contactId: null,
-        name: res[0].getValue('companyname') || res[0].getValue('entityid')
+        name: res[0].getValue('companyname') || res[0].getValue('entityid'),
+        note: ''
       };
     }
 
@@ -72,54 +80,86 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/email', 'N/log'],
 
       if (!res || !res.length) return null;
 
+      var companyId = res[0].getValue('company') || null;
+
       return {
         source: 'contact',
-        customerId: res[0].getValue('company') || null,   // parent company, may be blank
-        contactId: res[0].getValue('internalid'),
-        name: res[0].getValue('entityid')
+        customerId: companyId,
+        // A contact can only go on the case when it has a parent company — NetSuite
+        // validates the contact against the company and rejects orphans at save().
+        contactId: companyId ? res[0].getValue('internalid') : null,
+        name: res[0].getValue('entityid'),
+        note: companyId ? '' : 'Contact has no parent company, so it was not attached to the case.'
       };
     }
 
     function lookupEntity(emailAddr) {
-      if (!emailAddr) return { source: 'none', customerId: null, contactId: null, name: '' };
+      var empty = { source: 'none', customerId: null, contactId: null, name: '', note: '' };
+      if (!emailAddr) return empty;
 
-      var hit = findCustomerByEmail(emailAddr) || findContactByEmail(emailAddr);
-      if (hit) {
-        log.audit('Entity matched by email', hit);
-        return hit;
+      var hit = findCustomerByEmail(emailAddr) || findContactByEmail(emailAddr) || empty;
+
+      // No usable company? Fall back to the generic customer if one is configured.
+      if (!hit.customerId && CFG.FALLBACK_CUSTOMER_ID) {
+        hit.customerId = CFG.FALLBACK_CUSTOMER_ID;
+        hit.note = (hit.note ? hit.note + ' ' : '') + 'Fallback customer used as the case company.';
       }
 
-      log.audit('No entity matched', emailAddr);
-      return { source: 'none', customerId: null, contactId: null, name: '' };
+      log.audit('Entity lookup result', hit);
+      return hit;
     }
 
     // ── Step 2: create the case ──────────────────────────────────
-    function createCase(d, entity) {
+    // opts lets the retry drop whatever NetSuite objected to.
+    function buildCase(d, entity, opts) {
       var rec = record.create({ type: record.Type.SUPPORT_CASE });
 
-      if (CFG.CASE_CUSTOM_FORM) {
-        try { rec.setValue({ fieldId: 'customform', value: CFG.CASE_CUSTOM_FORM }); } catch (e) {}
-      }
+      if (CFG.CASE_CUSTOM_FORM) rec.setValue({ fieldId: 'customform', value: CFG.CASE_CUSTOM_FORM });
 
-      // Attach the matched records
       if (entity.customerId) rec.setValue({ fieldId: 'company', value: entity.customerId });
-      if (entity.contactId) {
-        try { rec.setValue({ fieldId: 'contact', value: entity.contactId }); } catch (e) { log.debug('contact skipped', e); }
+      if (opts.withContact && entity.contactId && entity.customerId) {
+        rec.setValue({ fieldId: 'contact', value: entity.contactId });
       }
 
       rec.setValue({ fieldId: 'title', value: d.subject });
       rec.setValue({ fieldId: 'incomingmessage', value: d.message });
 
-      if (d.email) { try { rec.setValue({ fieldId: 'email', value: d.email }); } catch (e) {} }
-      if (d.phone) { try { rec.setValue({ fieldId: 'phone', value: d.phone }); } catch (e) {} }
+      if (d.email) rec.setValue({ fieldId: 'email', value: d.email });
+      if (d.phone) rec.setValue({ fieldId: 'phone', value: d.phone });
 
-      if (CFG.CASE_PRIORITY) { try { rec.setValue({ fieldId: 'priority', value: CFG.CASE_PRIORITY }); } catch (e) { log.debug('priority skipped', e); } }
-      if (CFG.CASE_STATUS)   { try { rec.setValue({ fieldId: 'status',   value: CFG.CASE_STATUS });   } catch (e) { log.debug('status skipped', e); } }
-      if (CFG.CASE_ORIGIN)   { try { rec.setValue({ fieldId: 'origin',   value: CFG.CASE_ORIGIN });   } catch (e) { log.debug('origin skipped', e); } }
+      if (opts.withOptionalLists) {
+        if (CFG.CASE_PRIORITY) rec.setValue({ fieldId: 'priority', value: CFG.CASE_PRIORITY });
+        if (CFG.CASE_STATUS)   rec.setValue({ fieldId: 'status',   value: CFG.CASE_STATUS });
+        if (CFG.CASE_ORIGIN)   rec.setValue({ fieldId: 'origin',   value: CFG.CASE_ORIGIN });
+      }
 
-      var caseId = rec.save({ enableSourcing: true, ignoreMandatoryFields: true });
-      log.audit('Case created', { caseId: caseId, entity: entity });
-      return caseId;
+      return rec;
+    }
+
+    function createCase(d, entity) {
+      // Each attempt drops one more optional piece. Field validation happens at save(),
+      // so this is the only reliable way to find out what the account will accept.
+      var attempts = [
+        { withContact: true,  withOptionalLists: true,  label: 'full' },
+        { withContact: false, withOptionalLists: true,  label: 'without contact' },
+        { withContact: false, withOptionalLists: false, label: 'minimum fields' }
+      ];
+
+      var lastError = null;
+
+      for (var i = 0; i < attempts.length; i++) {
+        try {
+          var rec = buildCase(d, entity, attempts[i]);
+          var caseId = rec.save({ enableSourcing: true, ignoreMandatoryFields: true });
+          log.audit('Case created', { caseId: caseId, attempt: attempts[i].label, entity: entity });
+          return { caseId: caseId, attempt: attempts[i].label };
+        } catch (e) {
+          lastError = e;
+          log.error('Case save failed (' + attempts[i].label + ')', e.message || e);
+        }
+      }
+
+      throw lastError;
     }
 
     // ── Step 3: notify the team ──────────────────────────────────
@@ -131,15 +171,19 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/email', 'N/log'],
     }
 
     function matchLabel(entity) {
-      if (entity.source === 'customer') return 'Customer #' + entity.customerId + ' (' + entity.name + ')';
-      if (entity.source === 'contact') {
-        return 'Contact #' + entity.contactId + ' (' + entity.name + ')'
-          + (entity.customerId ? ' — company #' + entity.customerId : ' — no parent company');
+      var base;
+      if (entity.source === 'customer') {
+        base = 'Customer #' + entity.customerId + ' (' + entity.name + ')';
+      } else if (entity.source === 'contact') {
+        base = 'Contact #' + (entity.contactId || 'n/a') + ' (' + entity.name + ')'
+          + (entity.customerId ? ' under company #' + entity.customerId : ' with no parent company');
+      } else {
+        base = 'No match for this email address';
       }
-      return 'No match — case created without a company';
+      return entity.note ? base + ' — ' + entity.note : base;
     }
 
-    function sendNotification(d, entity, caseId, error) {
+    function sendNotification(d, entity, result, error) {
       var table = '<table style="border-collapse:collapse;width:100%;max-width:640px;font-family:Arial,sans-serif;font-size:14px;">'
         + row('Name', (d.firstname + ' ' + d.lastname).trim())
         + row('Email', d.email)
@@ -151,13 +195,17 @@ define(['N/ui/serverWidget', 'N/record', 'N/search', 'N/email', 'N/log'],
 
       var subject, body;
 
-      if (caseId) {
-        subject = 'New Case #' + caseId + ': ' + d.subject;
+      if (result && result.caseId) {
+        subject = 'New Case #' + result.caseId + ': ' + d.subject;
         body = '<p>A case was created from the website form.</p>' + table
-          + '<p><a href="' + CFG.CASE_LINK_BASE + caseId + '" target="_blank">Open the case in NetSuite</a></p>';
+          + '<p><a href="' + CFG.CASE_LINK_BASE + result.caseId + '" target="_blank">Open the case in NetSuite</a></p>'
+          + (result.attempt !== 'full'
+              ? '<p><i>Saved on the "' + esc(result.attempt) + '" attempt — some optional fields were dropped.</i></p>'
+              : '');
       } else {
         subject = 'Case Creation FAILED: ' + d.email;
-        body = '<p>The form was submitted but the case could not be created.</p>' + table
+        body = '<p>The form was submitted but no case could be created. The details are below so nothing is lost.</p>'
+          + table
           + '<p><b>Error:</b> ' + esc((error && error.message) ? error.message : 'Unknown error') + '</p>';
       }
 
@@ -242,12 +290,21 @@ document.addEventListener('submit', function(){
 </script>`;
     }
 
-    function thankYouHtml(caseId) {
+    function resultPage(caseId, error) {
+      if (caseId) {
+        return '<!doctype html><meta charset="utf-8">'
+          + '<div style="font-family:Arial,sans-serif;text-align:center;margin-top:60px;">'
+          + '<h2 style="color:#2e7d32;">Thanks — your case has been submitted.</h2>'
+          + '<p style="font-size:16px;color:#555;">Reference number: <b>' + esc(caseId) + '</b></p>'
+          + '<p style="font-size:16px;color:#555;">Someone from the team will get back to you shortly.</p>'
+          + '</div>';
+      }
+
       return '<!doctype html><meta charset="utf-8">'
         + '<div style="font-family:Arial,sans-serif;text-align:center;margin-top:60px;">'
-        + '<h2 style="color:#2e7d32;">Thanks — your case has been submitted.</h2>'
-        + (caseId ? '<p style="font-size:16px;color:#555;">Reference number: <b>' + esc(caseId) + '</b></p>' : '')
-        + '<p style="font-size:16px;color:#555;">Someone from the team will get back to you shortly.</p>'
+        + '<h2 style="color:#b00020;">We could not open a case just now.</h2>'
+        + '<p style="font-size:16px;color:#555;">Your details reached our team by email, so nothing is lost — someone will follow up.</p>'
+        + '<p style="font-size:13px;color:#999;">Reason: ' + esc((error && error.message) ? error.message : 'Unknown error') + '</p>'
         + '</div>';
     }
 
@@ -256,7 +313,7 @@ document.addEventListener('submit', function(){
       var req = context.request;
       var res = context.response;
 
-      log.audit('CASE SUITELET HIT', { method: req.method, params: req.parameters });
+      log.audit('CASE SUITELET HIT', { method: req.method });
 
       if (req.method === 'GET') {
         var form = serverWidget.createForm({ title: '&nbsp;' });
@@ -292,16 +349,19 @@ document.addEventListener('submit', function(){
           return;
         }
 
-        var caseId = null;
+        var result = null;
+        var failure = null;
+
         try {
-          caseId = createCase(d, entity);
-          sendNotification(d, entity, caseId);
+          result = createCase(d, entity);
         } catch (e) {
-          log.error('Case creation failed', e);
-          sendNotification(d, entity, null, e);
+          failure = e;
+          log.error('Case creation failed after all attempts', e);
         }
 
-        res.write(thankYouHtml(caseId));
+        sendNotification(d, entity, result, failure);
+
+        res.write(resultPage(result && result.caseId, failure));
         return;
       }
     }
