@@ -25,7 +25,7 @@
       <name>State 1</name>
       <positionx>733</positionx>
       <positiony>153</positiony>
-      <workflowactions triggertype="ONENTRY">
+      <workflowactions triggertype="BEFORELOAD">
         <addbuttonaction scriptid="workflowaction389">
           <buttondescription></buttondescription>
           <checkconditionbeforeexecution>T</checkconditionbeforeexecution>
