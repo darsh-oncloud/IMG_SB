@@ -81,6 +81,18 @@
             <formula></formula>
             <type>VISUAL_BUILDER</type>
           </initcondition>
+          <fieldsettings>
+            <fieldsetting>
+              <targetfield>STDBODYMEMO</targetfield>
+              <valuechecked></valuechecked>
+              <valuedate></valuedate>
+              <valuefield>STDENTITYENTITYID</valuefield>
+              <valueformula></valueformula>
+              <valuejoinfield>[scriptid=custevent_cmms_created_by]</valuejoinfield>
+              <valueselect></valueselect>
+              <valuetext></valuetext>
+            </fieldsetting>
+          </fieldsettings>
         </gotorecordaction>
       </workflowactions>
     </workflowstate>
