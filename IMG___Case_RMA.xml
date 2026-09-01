@@ -83,12 +83,12 @@
           </initcondition>
           <fieldsettings>
             <fieldsetting>
-              <targetfield>STDBODYMEMO</targetfield>
+              <targetfield>STDBODYCUSTOMER</targetfield>
               <valuechecked></valuechecked>
               <valuedate></valuedate>
-              <valuefield>STDENTITYENTITYID</valuefield>
+              <valuefield>STDEVENTCOMPANY</valuefield>
               <valueformula></valueformula>
-              <valuejoinfield>[scriptid=custevent_cmms_created_by]</valuejoinfield>
+              <valuejoinfield></valuejoinfield>
               <valueselect></valueselect>
               <valuetext></valuetext>
             </fieldsetting>
