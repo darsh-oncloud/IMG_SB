@@ -4,13 +4,25 @@
  */
 define(['N/search'], (search) => {
 
-    const saveRecord = (context) => {
-        try {
-            const rec = context.currentRecord;
+    const validateField = (context) => {
 
-            const po = (rec.getValue({
-                fieldId: 'otherrefnum'
-            }) || '').trim();
+        try {
+
+            const rec = context.currentRecord;
+            const fieldId = context.fieldId;
+
+            // Only validate PO/Check Number field
+            if (fieldId !== 'otherrefnum') {
+                return true;
+            }
+
+            const po = String(
+                rec.getValue({
+                    fieldId: 'otherrefnum'
+                }) || ''
+            ).trim();
+
+            console.log('PO entered:', po);
 
             if (!po) {
                 return true;
@@ -22,7 +34,7 @@ define(['N/search'], (search) => {
                 ['otherrefnum', 'equalto', po]
             ];
 
-            // Exclude current Sales Order while editing
+            // Exclude current SO when editing
             if (rec.id) {
                 filters.push(
                     'AND',
@@ -30,26 +42,22 @@ define(['N/search'], (search) => {
                 );
             }
 
-            const salesOrderSearch = search.create({
+            const duplicateSearch = search.create({
                 type: search.Type.SALES_ORDER,
                 filters: filters,
                 columns: [
-                    search.createColumn({
-                        name: 'internalid'
-                    }),
-                    search.createColumn({
-                        name: 'tranid'
-                    }),
-                    search.createColumn({
-                        name: 'otherrefnum'
-                    })
+                    'internalid',
+                    'tranid',
+                    'otherrefnum'
                 ]
             });
 
-            const results = salesOrderSearch.run().getRange({
+            const results = duplicateSearch.run().getRange({
                 start: 0,
                 end: 1
             });
+
+            console.log('Duplicate results:', results.length);
 
             if (results.length > 0) {
 
@@ -71,12 +79,13 @@ define(['N/search'], (search) => {
 
         } catch (e) {
 
-            // Allow save if unexpected script error occurs
+            console.error('Duplicate PO Validation Error', e);
+
             return true;
         }
     };
 
     return {
-        saveRecord: saveRecord
+        validateField: validateField
     };
 });
