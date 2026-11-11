@@ -6,7 +6,7 @@ define(['N/search', 'N/record'], function (search, record) {
 
     function afterSubmit(context) {
 
-        if (context.type !== context.UserEventType.EDIT) return;
+        if (context.type !== context.UserEventType.CREATE) return;
 
         try {
             var caseId = context.newRecord.getValue('custrecord_case');
